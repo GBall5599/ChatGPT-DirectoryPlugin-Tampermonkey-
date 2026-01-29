@@ -1,0 +1,573 @@
+// ==UserScript==
+// @name         ChatGPT 提问目录 - 右侧箭头栏(默认收起/悬停展开/最后一次点击生效/可中断跳转/无冷却)
+// @namespace    https://tampermonkey.net/
+// @version      2.6.0
+// @description  chatgpt.com / chat.openai.com：右侧提问目录；箭头收起指向里侧，展开指向外侧；悬停展开；点击跳转可被新点击立即中断（最后一次点击生效）；不再有“跳转冷却”；滚动自动选中；仅侧边栏选中高亮；字体放大
+// @author       GBALL5599
+// @match        https://chatgpt.com/*
+// @match        https://chat.openai.com/*
+// @run-at       document-end
+// @grant        GM_addStyle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const CONFIG = {
+    maxTitleLen: 60,
+    refreshDebounceMs: 220,
+
+    panelWidth: 360,
+    handleWidth: 18,
+
+    rightInsetPx: 32,
+
+    topOffset: 84,
+    bottomOffset: 20,
+
+    collapseDelayMs: 140,
+
+    // 自动高亮区域
+    highlightRootMargin: '-35% 0px -55% 0px',
+
+    headerFontPx: 15,
+    listFontPx: 15,
+
+    // 跳转可靠性：重试次数与间隔
+    scrollRetryMax: 14,
+    scrollRetryIntervalMs: 35,
+
+    // 点击跳转时，IO 抑制的最长时间（会提前解除）
+    maxIoSuppressMs: 900,
+
+    zIndex: 9999,
+  };
+
+  GM_addStyle(`
+    #tm-toc-wrap{
+      position: fixed;
+      top: ${CONFIG.topOffset}px;
+      right: ${CONFIG.rightInsetPx}px;
+      height: calc(100vh - ${CONFIG.topOffset + CONFIG.bottomOffset}px);
+      z-index: ${CONFIG.zIndex};
+      display: flex;
+      align-items: stretch;
+      gap: 10px;
+      pointer-events: auto;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji","Segoe UI Emoji";
+      transform: translateZ(0);
+      backface-visibility: hidden;
+      will-change: transform;
+    }
+
+    #tm-toc-handle{
+      width: ${CONFIG.handleWidth}px;
+      height: 100%;
+      border-radius: 999px;
+      background: rgba(20, 35, 65, 0.55);
+      border: 1px solid rgba(255,255,255,0.08);
+      box-shadow: 0 10px 24px rgba(0,0,0,0.35);
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      user-select:none;
+      transform: translateZ(0);
+      backface-visibility: hidden;
+      will-change: transform;
+    }
+    @media (prefers-color-scheme: light){
+      #tm-toc-handle{
+        background: rgba(15, 25, 45, 0.22);
+        border: 1px solid rgba(0,0,0,0.06);
+        box-shadow: 0 10px 24px rgba(0,0,0,0.12);
+      }
+    }
+
+    #tm-toc-arrow{
+      width: 0;
+      height: 0;
+      border-top: 7px solid transparent;
+      border-bottom: 7px solid transparent;
+      border-right: 9px solid rgba(220,235,255,0.9); /* 收起态：向左 */
+      opacity: .95;
+      transition: opacity .12s, border-color .12s;
+      transform: translateZ(0);
+      backface-visibility: hidden;
+    }
+    @media (prefers-color-scheme: light){
+      #tm-toc-arrow{ border-right-color: rgba(20,30,45,0.75); }
+    }
+
+    #tm-toc-wrap.is-open #tm-toc-arrow{
+      border-right: 0;
+      border-left: 9px solid rgba(220,235,255,0.9); /* 展开态：向右 */
+    }
+    @media (prefers-color-scheme: light){
+      #tm-toc-wrap.is-open #tm-toc-arrow{ border-left-color: rgba(20,30,45,0.75); }
+    }
+
+    #tm-toc-panel{
+      width: ${CONFIG.panelWidth}px;
+      height: 100%;
+      border-radius: 14px;
+      background: rgba(18,18,18,0.84);
+      color: #eee;
+      border: 1px solid rgba(255,255,255,0.10);
+      box-shadow: 0 10px 28px rgba(0,0,0,0.45);
+      overflow: hidden;
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+      transform: translateZ(0);
+      backface-visibility: hidden;
+      will-change: transform;
+
+      opacity: 0;
+      pointer-events: none;
+      transform: translateX(10px) translateZ(0);
+      transition: opacity .12s ease, transform .12s ease;
+    }
+    @media (prefers-color-scheme: light){
+      #tm-toc-panel{
+        background: rgba(255,255,255,0.92);
+        color: #111;
+        border: 1px solid rgba(0,0,0,0.08);
+        box-shadow: 0 10px 28px rgba(0,0,0,0.14);
+      }
+    }
+    #tm-toc-wrap.is-open #tm-toc-panel{
+      opacity: 1;
+      pointer-events: auto;
+      transform: translateX(0px) translateZ(0);
+    }
+
+    #tm-toc-header{
+      display:flex;
+      align-items:center;
+      justify-content: space-between;
+      padding: 10px 12px 8px 12px;
+      border-bottom: 1px solid rgba(255,255,255,0.10);
+      user-select:none;
+      gap: 8px;
+      font-size: ${CONFIG.headerFontPx}px;
+      font-weight: 800;
+    }
+    @media (prefers-color-scheme: light){
+      #tm-toc-header{ border-bottom: 1px solid rgba(0,0,0,0.07); }
+    }
+    #tm-toc-title{
+      display:flex;
+      align-items:center;
+      gap: 8px;
+      min-width: 0;
+    }
+    #tm-toc-title .badge{
+      font-size: ${CONFIG.headerFontPx - 1}px;
+      font-weight: 800;
+      opacity: .7;
+    }
+
+    #tm-toc-list{
+      overflow:auto;
+      height: calc(100% - 46px);
+      padding: 10px;
+    }
+
+    .tm-item{
+      display:flex;
+      gap: 10px;
+      align-items:flex-start;
+      padding: 9px 10px;
+      border-radius: 10px;
+      line-height: 1.35;
+      font-size: ${CONFIG.listFontPx}px;
+      border: 1px solid transparent;
+      cursor:pointer;
+      user-select: none;
+      opacity: .92;
+      transition: opacity .12s, background .12s, border-color .12s;
+      transform: translateZ(0);
+      backface-visibility: hidden;
+    }
+    .tm-item:hover{
+      background: transparent;
+      border-color: transparent;
+    }
+    .tm-item .idx{
+      font-weight: 900;
+      opacity: .55;
+      min-width: 28px;
+      text-align: right;
+      flex-shrink: 0;
+    }
+    .tm-item .txt{
+      flex: 1;
+      min-width: 0;
+      word-break: break-word;
+    }
+    .tm-item.is-active{
+      opacity: 1;
+      background: rgba(59,130,246,0.18);
+      border-color: rgba(59,130,246,0.35);
+    }
+    @media (prefers-color-scheme: light){
+      .tm-item.is-active{
+        background: rgba(59,130,246,0.12);
+        border-color: rgba(59,130,246,0.28);
+      }
+    }
+  `);
+
+  // ---------------- utils ----------------
+  function debounce(fn, ms) {
+    let t = null;
+    return (...args) => {
+      clearTimeout(t);
+      t = setTimeout(() => fn(...args), ms);
+    };
+  }
+
+  function safeText(el) {
+    if (!el) return '';
+    return (el.innerText || el.textContent || '').replace(/\s+/g, ' ').trim();
+  }
+
+  function ellipsis(str, maxLen) {
+    if (!str) return '';
+    return str.length > maxLen ? str.slice(0, maxLen - 1) + '…' : str;
+  }
+
+  function hashStr(str) {
+    let h = 2166136261;
+    for (let i = 0; i < str.length; i++) {
+      h ^= str.charCodeAt(i);
+      h = Math.imul(h, 16777619);
+    }
+    return (h >>> 0).toString(16);
+  }
+
+  function normalizeTitle(text) {
+    const t = (text || '').trim();
+    if (!t) return '';
+    const cut = t.split(/\n|。|？|\?|！|!/)[0].trim();
+    return ellipsis(cut || t, CONFIG.maxTitleLen);
+  }
+
+  function getAnchorNodeFromUserRoleNode(roleNode) {
+    let n = roleNode;
+    for (let i = 0; i < 8 && n; i++) {
+      if (n.tagName === 'ARTICLE' || n.tagName === 'SECTION' || n.tagName === 'LI') return n;
+      if (n.getAttribute && (n.getAttribute('data-testid') || n.getAttribute('data-message-id'))) return n;
+      n = n.parentElement;
+    }
+    return roleNode;
+  }
+
+  // ---------------- UI ----------------
+  let wrap, panel, listEl, badgeEl, handle;
+  let io = null;
+  let mo = null;
+
+  // active state (sidebar only)
+  let activeId = null;
+  const idToItemEl = new Map();
+  const idToAnchorEl = new Map();
+
+  let collapseTimer = null;
+
+  // “最后一次点击生效” + 可中断跳转
+  let lastJumpToken = 0;
+  let currentJump = null; // { token, rafId, timerIds[] }
+
+  // 只抑制 IO（不影响点击）；并且“到位后立即解除抑制”
+  let suppressIoUntil = 0;
+
+  function ensureUI() {
+    if (wrap) return;
+
+    wrap = document.createElement('div');
+    wrap.id = 'tm-toc-wrap';
+
+    panel = document.createElement('div');
+    panel.id = 'tm-toc-panel';
+
+    const header = document.createElement('div');
+    header.id = 'tm-toc-header';
+
+    const title = document.createElement('div');
+    title.id = 'tm-toc-title';
+    title.innerHTML = `📌 提问目录 <span class="badge" id="tm-toc-badge">0</span>`;
+    badgeEl = title.querySelector('#tm-toc-badge');
+
+    header.appendChild(title);
+
+    listEl = document.createElement('div');
+    listEl.id = 'tm-toc-list';
+
+    panel.appendChild(header);
+    panel.appendChild(listEl);
+
+    handle = document.createElement('div');
+    handle.id = 'tm-toc-handle';
+    const arrowEl = document.createElement('div');
+    arrowEl.id = 'tm-toc-arrow';
+    handle.appendChild(arrowEl);
+
+    wrap.appendChild(panel);
+    wrap.appendChild(handle);
+
+    document.body.appendChild(wrap);
+
+    // 悬停展开/收起
+    wrap.addEventListener('pointerenter', () => {
+      if (collapseTimer) clearTimeout(collapseTimer);
+      wrap.classList.add('is-open');
+    });
+
+    wrap.addEventListener('pointerleave', () => {
+      if (collapseTimer) clearTimeout(collapseTimer);
+      collapseTimer = setTimeout(() => {
+        wrap.classList.remove('is-open');
+      }, CONFIG.collapseDelayMs);
+    });
+
+    wrap.classList.remove('is-open');
+  }
+
+  // ---------------- data ----------------
+  function findUserMessages() {
+    const main = document.querySelector('main');
+    if (!main) return [];
+    return Array.from(main.querySelectorAll('[data-message-author-role="user"]'));
+  }
+
+  function markAnchor(anchorNode, stableKey) {
+    const id = `tm-toc-${stableKey}`;
+    anchorNode.setAttribute('data-tm-toc-id', id);
+    return id;
+  }
+
+  function extractItems() {
+    const roleNodes = findUserMessages();
+    const items = [];
+    const seen = new Set();
+
+    roleNodes.forEach((roleNode, idx) => {
+      const full = safeText(roleNode);
+      if (!full) return;
+      if (full.length > 8000) return;
+
+      const title = normalizeTitle(full);
+      if (!title) return;
+
+      const keyBase = hashStr(full.slice(0, 700));
+      const dedupKey = `${keyBase}-${idx}`;
+      if (seen.has(dedupKey)) return;
+      seen.add(dedupKey);
+
+      const anchorNode = getAnchorNodeFromUserRoleNode(roleNode);
+      const anchorId = markAnchor(anchorNode, dedupKey);
+
+      items.push({ title, full, anchorId, anchorNode });
+    });
+
+    return items;
+  }
+
+  // ---------------- active ----------------
+  function setActive(anchorId, { scrollPanelIntoView = false } = {}) {
+    if (!anchorId) return;
+
+    if (activeId && idToItemEl.get(activeId)) idToItemEl.get(activeId).classList.remove('is-active');
+    activeId = anchorId;
+
+    const row = idToItemEl.get(anchorId);
+    if (row) {
+      row.classList.add('is-active');
+      if (scrollPanelIntoView) row.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  }
+
+  // ---------------- jump: interruptible + last click wins ----------------
+  function cancelCurrentJump() {
+    if (!currentJump) return;
+    try {
+      if (currentJump.rafId) cancelAnimationFrame(currentJump.rafId);
+      if (currentJump.timerIds && currentJump.timerIds.length) {
+        currentJump.timerIds.forEach(id => clearTimeout(id));
+      }
+    } catch (_) {}
+    currentJump = null;
+  }
+
+  function jumpTo(anchorId) {
+    // 任何新点击：立即中断当前跳转
+    cancelCurrentJump();
+
+    const myToken = ++lastJumpToken;
+    setActive(anchorId, { scrollPanelIntoView: true });
+
+    // 只抑制 IO，避免选中乱跳；但不影响后续点击（因为点击会 cancel + 更新 token）
+    suppressIoUntil = Date.now() + CONFIG.maxIoSuppressMs;
+
+    const timerIds = [];
+    currentJump = { token: myToken, rafId: 0, timerIds };
+
+    const getEl = () => idToAnchorEl.get(anchorId) || document.querySelector(`[data-tm-toc-id="${CSS.escape(anchorId)}"]`);
+
+    const isCenteredEnough = (el) => {
+      const r = el.getBoundingClientRect();
+      const mid = window.innerHeight / 2;
+      const elMid = r.top + r.height / 2;
+      return Math.abs(elMid - mid) < Math.min(160, window.innerHeight * 0.18);
+    };
+
+    const doScrollOnce = (el) => {
+      // 如果还在平滑滚动，新的点击会 cancelCurrentJump() 并覆盖
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    };
+
+    const step = (attempt) => {
+      // 被新点击替换
+      if (!currentJump || currentJump.token !== myToken || myToken !== lastJumpToken) return;
+
+      const el = getEl();
+      if (!el) {
+        if (attempt < CONFIG.scrollRetryMax) {
+          timerIds.push(setTimeout(() => step(attempt + 1), CONFIG.scrollRetryIntervalMs));
+        }
+        return;
+      }
+
+      doScrollOnce(el);
+
+      // 下一次检查：到位则立即解除 IO 抑制并结束
+      timerIds.push(setTimeout(() => {
+        if (!currentJump || currentJump.token !== myToken || myToken !== lastJumpToken) return;
+
+        if (isCenteredEnough(el)) {
+          // 到位：立刻解除抑制，不再出现“跳完后还不能跳”的感觉
+          suppressIoUntil = 0;
+          currentJump = null;
+          return;
+        }
+
+        if (attempt < CONFIG.scrollRetryMax) step(attempt + 1);
+        else {
+          // 到达重试上限也解除抑制，避免残留“卡住”
+          suppressIoUntil = 0;
+          currentJump = null;
+        }
+      }, CONFIG.scrollRetryIntervalMs));
+    };
+
+    step(0);
+  }
+
+  // ---------------- IO (auto select) ----------------
+  function rebuildIO(items) {
+    if (io) io.disconnect();
+
+    io = new IntersectionObserver(
+      (entries) => {
+        if (Date.now() < suppressIoUntil) return;
+
+        const visible = entries.filter(e => e.isIntersecting);
+        if (!visible.length) return;
+
+        visible.sort((a, b) => (b.intersectionRatio || 0) - (a.intersectionRatio || 0));
+        const top = visible[0];
+        const anchorId = top.target.getAttribute('data-tm-toc-id');
+        if (anchorId) setActive(anchorId, { scrollPanelIntoView: false });
+      },
+      {
+        root: null,
+        rootMargin: CONFIG.highlightRootMargin,
+        threshold: [0.01, 0.1, 0.25, 0.5, 0.75, 0.9],
+      }
+    );
+
+    idToAnchorEl.clear();
+    items.forEach(it => {
+      idToAnchorEl.set(it.anchorId, it.anchorNode);
+      io.observe(it.anchorNode);
+    });
+  }
+
+  // ---------------- render ----------------
+  function buildPanel(items) {
+    listEl.innerHTML = '';
+    idToItemEl.clear();
+
+    items.forEach((it, i) => {
+      const row = document.createElement('div');
+      row.className = 'tm-item';
+      row.innerHTML = `
+        <div class="idx">${i + 1}</div>
+        <div class="txt" title="${it.full.replace(/"/g, '&quot;')}">${it.title}</div>
+      `;
+      row.addEventListener('click', () => jumpTo(it.anchorId));
+      listEl.appendChild(row);
+
+      idToItemEl.set(it.anchorId, row);
+    });
+
+    badgeEl.textContent = String(items.length);
+  }
+
+  const refresh = debounce((force) => {
+    ensureUI();
+
+    const items = extractItems();
+    buildPanel(items);
+    rebuildIO(items);
+
+    if (items.length) {
+      const fallback = items[items.length - 1].anchorId;
+      const next = (activeId && idToItemEl.has(activeId)) ? activeId : fallback;
+      setActive(next, { scrollPanelIntoView: false });
+    } else {
+      activeId = null;
+    }
+
+    if (force) wrap.classList.remove('is-open');
+  }, CONFIG.refreshDebounceMs);
+
+  // ---------------- observers ----------------
+  function startMutationObserver() {
+    if (mo) mo.disconnect();
+    mo = new MutationObserver(() => refresh(false));
+    mo.observe(document.body, { childList: true, subtree: true });
+  }
+
+  function hookHistory() {
+    const _push = history.pushState;
+    const _replace = history.replaceState;
+
+    function onRouteChange() {
+      cancelCurrentJump();
+      activeId = null;
+      suppressIoUntil = 0;
+      setTimeout(() => refresh(true), 600);
+    }
+
+    history.pushState = function () {
+      _push.apply(this, arguments);
+      onRouteChange();
+    };
+    history.replaceState = function () {
+      _replace.apply(this, arguments);
+      onRouteChange();
+    };
+    window.addEventListener('popstate', onRouteChange);
+  }
+
+  // ---------------- init ----------------
+  function init() {
+    ensureUI();
+    startMutationObserver();
+    hookHistory();
+    setTimeout(() => refresh(true), 900);
+  }
+
+  init();
+})();
