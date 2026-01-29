@@ -1,4 +1,5 @@
-# ChatGPT-Tampermonkey-
+# ChatGPT目录插件
+在Tampermonkey使用
 使用插件实现网页版ChatGPT没有的对话跳转功能
 适用于：chatgpt.com / chat.openai.com：
 ## 主要功能
